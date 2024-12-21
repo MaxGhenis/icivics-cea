@@ -31,18 +31,14 @@ def run_impact_simulation(params, n_sims=1000):
 
             # Calculate voters this year
             # Use normal approximation for timing window
-            voting_window = np.exp(
-                -((year - years_to_vote) ** 2) / 8
-            )  # 2-year SD
+            voting_window = np.exp(-((year - years_to_vote) ** 2) / 8)  # 2-year SD
 
             if voting_window > 0.1:  # If significant voting activity this year
                 # Basic voting probability
                 vote_prob = ~sq.beta(5, 3) * params["voting_rate_boost"]
 
                 # Policy alignment improvement
-                alignment_effect = (
-                    ~sq.beta(4, 4) * params["alignment_improvement"]
-                )
+                alignment_effect = ~sq.beta(4, 4) * params["alignment_improvement"]
 
                 # Calculate actual voters considering retention
                 effective_voters = (
@@ -64,36 +60,25 @@ def run_impact_simulation(params, n_sims=1000):
                                 0.6,
                                 sq.lognorm(10 * K, 100 * K),
                             ],  # Local: 10K-100K voters
-                            [
-                                0.3,
-                                sq.lognorm(100 * K, 1 * M),
-                            ],  # State: 100K-1M voters
-                            [
-                                0.1,
-                                sq.lognorm(1 * M, 10 * M),
-                            ],  # Federal: 1M-10M voters
+                            [0.3, sq.lognorm(100 * K, 1 * M)],  # State: 100K-1M voters
+                            [0.1, sq.lognorm(1 * M, 10 * M)],  # Federal: 1M-10M voters
                         ]
                     )
 
-                    # Probability of swinging election
+                    # Ensure probability is strictly between 0 and 1
                     swing_prob = min(
-                        aligned_voters / (election_size * margin), 1
+                        max(float(aligned_voters / (election_size * margin)), 0.001),
+                        0.999,
                     )
 
                     # If election swings, calculate policy value
-                    if ~sq.bernoulli(float(swing_prob)):
+                    if ~sq.bernoulli(swing_prob):
                         # Policy value distribution varies by race type
                         policy_value = ~sq.mixture(
                             [
                                 [0.6, sq.lognorm(100, 10 * K)],  # Local policy
-                                [
-                                    0.3,
-                                    sq.lognorm(10 * K, 100 * K),
-                                ],  # State policy
-                                [
-                                    0.1,
-                                    sq.lognorm(100 * K, 1 * M),
-                                ],  # Federal policy
+                                [0.3, sq.lognorm(10 * K, 100 * K)],  # State policy
+                                [0.1, sq.lognorm(100 * K, 1 * M)],  # Federal policy
                             ]
                         )
                         total_qalys += policy_value
@@ -267,12 +252,8 @@ def create_impact_app():
         # Plot distribution
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.hist(results, bins=50, density=True)
-        ax.axvline(
-            np.mean(results), color="r", linestyle="dashed", label="Mean"
-        )
-        ax.axvline(
-            np.median(results), color="g", linestyle="dashed", label="Median"
-        )
+        ax.axvline(np.mean(results), color="r", linestyle="dashed", label="Mean")
+        ax.axvline(np.median(results), color="g", linestyle="dashed", label="Median")
         ax.set_title("Distribution of Cost-Effectiveness Estimates")
         ax.set_xlabel("QALYs per Dollar")
         ax.set_ylabel("Density")
