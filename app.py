@@ -6,284 +6,344 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 
-def run_impact_simulation(params, n_sims=1000):
-    """Run Monte Carlo simulation of civic education impact"""
+class Voter:
+    def __init__(self, altruism, accuracy, baseline_turnout_prob):
+        self.altruism = altruism  # Weight on QALYs vs other preferences (0-1)
+        self.accuracy = (
+            accuracy  # How well they perceive true QALYs (higher = less noise)
+        )
+        self.baseline_turnout_prob = baseline_turnout_prob
+
+    def perceive_qalys(self, true_qalys):
+        """Add noise to QALY perception based on accuracy"""
+        noise = np.random.normal(0, 1 / self.accuracy)
+        return true_qalys + noise
+
+    def vote_choice(self, candidate_qalys, other_preferences):
+        """Return preferred candidate based on QALYs and other preferences"""
+        perceived_qalys = {
+            k: self.perceive_qalys(v) for k, v in candidate_qalys.items()
+        }
+
+        utilities = {}
+        for candidate in candidate_qalys.keys():
+            utilities[candidate] = (
+                self.altruism * perceived_qalys[candidate]
+                + (1 - self.altruism) * other_preferences[candidate]
+            )
+
+        return max(utilities.items(), key=lambda x: x[1])[0]
+
+    def will_vote(self, civics_boost=0):
+        """Determine if voter turns out"""
+        return np.random.random() < (self.baseline_turnout_prob + civics_boost)
+
+
+class Election:
+    def __init__(self, year, state_pop=5 * M):
+        self.year = year
+        self.state_pop = state_pop
+        self.eligible_voters = []
+
+    def add_voter(self, voter):
+        self.eligible_voters.append(voter)
+
+    def get_qaly_impacts(self, term_years=4, decay_rate=0.8):
+        """Generate QALY impacts for candidates over time"""
+        # Candidate A: Higher QALY impact
+        qalys_a = {}
+        base_impact_a = ~sq.lognorm(50 * K, 200 * K)  # 50K-200K QALYs in first year
+        for y in range(self.year, self.year + 20):
+            if y < self.year + term_years:
+                qalys_a[y] = base_impact_a * (decay_rate ** (y - self.year))
+            else:
+                # Post-term effects decay faster
+                qalys_a[y] = base_impact_a * (decay_rate ** (2 * (y - self.year)))
+
+        # Candidate B: Lower QALY impact
+        qalys_b = {}
+        base_impact_b = ~sq.lognorm(10 * K, 50 * K)  # 10K-50K QALYs in first year
+        for y in range(self.year, self.year + 20):
+            if y < self.year + term_years:
+                qalys_b[y] = base_impact_b * (decay_rate ** (y - self.year))
+            else:
+                qalys_b[y] = base_impact_b * (decay_rate ** (2 * (y - self.year)))
+
+        return {"A": qalys_a, "B": qalys_b}
+
+    def run_election(self, civics_boost=0):
+        """Run election and return results"""
+        votes = {"A": 0, "B": 0}
+        turnout = 0
+
+        # Get QALY impacts for candidates
+        candidate_qalys = self.get_qaly_impacts()
+        total_qalys_by_candidate = {
+            k: sum(v.values()) for k, v in candidate_qalys.items()
+        }
+
+        for voter in self.eligible_voters:
+            if voter.will_vote(civics_boost):
+                turnout += 1
+                # Generate random other preferences
+                other_prefs = {"A": np.random.normal(0, 1), "B": np.random.normal(0, 1)}
+                choice = voter.vote_choice(total_qalys_by_candidate, other_prefs)
+                votes[choice] += 1
+
+        winner = max(votes.items(), key=lambda x: x[1])[0]
+        margin = abs(votes["A"] - votes["B"]) / sum(votes.values())
+
+        return {
+            "winner": winner,
+            "margin": margin,
+            "turnout": turnout / len(self.eligible_voters),
+            "votes": votes,
+            "qaly_impact": candidate_qalys[winner],
+        }
+
+
+def simulate_civics_impact(params):
+    """Simulate impact of marginal civics funding over time"""
     results = []
 
-    for _ in range(n_sims):
-        # Calculate students reached
-        marginal_cost = ~sq.lognorm(
-            params["marginal_cost_low"], params["marginal_cost_high"]
-        )
-        students = params["marginal_budget"] / marginal_cost
+    # Generate baseline population parameters
+    baseline_altruism = ~sq.beta(2, 5)  # Right-skewed, mean around 0.3
+    baseline_accuracy = ~sq.lognorm(0.5, 2)  # How well voters perceive QALYs
+    baseline_turnout = ~sq.beta(4, 6)  # Right-skewed, mean around 0.4
 
-        # Calculate voting timing distribution
-        years_to_vote = ~sq.norm(
-            params["mean_years_to_vote"] - 2, params["mean_years_to_vote"] + 2
-        )
+    # Effect sizes from civics education
+    accuracy_boost = params["accuracy_improvement"]
+    turnout_boost = params["turnout_boost"]
 
-        # Calculate voting effects over time
-        total_qalys = 0
+    # Effect decay
+    annual_decay = params["effect_decay"]
 
-        for year in range(20):  # Look ahead 20 years
-            # Account for knowledge decay
-            knowledge_retention = params["knowledge_retention_rate"] ** year
+    # Run simulations for each year
+    progress_bar = st.progress(0)
+    for i, year in enumerate(range(2025, 2045)):
+        # Create election
+        election_base = Election(year)
+        election_treatment = Election(year)
 
-            # Calculate voters this year
-            # Use normal approximation for timing window
-            voting_window = np.exp(-((year - years_to_vote) ** 2) / 8)  # 2-year SD
+        # Add voters
+        n_voters = 5 * M  # State population
+        n_treated = int(params["marginal_budget"] / params["cost_per_student"])
 
-            if voting_window > 0.1:  # If significant voting activity this year
-                # Basic voting probability
-                vote_prob = ~sq.beta(5, 3) * params["voting_rate_boost"]
+        # Create a second progress bar for voter simulation
+        voter_progress = st.progress(0)
 
-                # Policy alignment improvement
-                alignment_effect = ~sq.beta(4, 4) * params["alignment_improvement"]
+        # Process voters in batches for efficiency
+        batch_size = 10000
+        for batch_i in range(0, n_voters, batch_size):
+            # Update progress bar every batch
+            voter_progress.progress(min(1.0, (batch_i + batch_size) / n_voters))
 
-                # Calculate actual voters considering retention
-                effective_voters = (
-                    students * vote_prob * knowledge_retention * voting_window
+            batch_end = min(batch_i + batch_size, n_voters)
+            for i in range(batch_i, batch_end):
+                # Basic voter characteristics
+                altruism = ~sq.beta(2, 5)
+                accuracy = ~sq.lognorm(0.5, 2)
+                turnout_prob = ~sq.beta(4, 6)
+
+                # Add to baseline election
+                election_base.add_voter(Voter(altruism, accuracy, turnout_prob))
+
+                # Add to treatment election with boosted parameters for treated population
+                if i < n_treated:
+                    # Apply civics education effects with decay
+                    years_since_treatment = max(0, year - 2025)
+                    current_accuracy_boost = accuracy_boost * (
+                        annual_decay**years_since_treatment
+                    )
+                    current_turnout_boost = turnout_boost * (
+                        annual_decay**years_since_treatment
+                    )
+
+                    # Check if voter is of voting age
+                    voter_age = np.random.uniform(params["min_age"], params["max_age"])
+                    years_to_vote = max(0, 18 - voter_age)
+
+                    if years_since_treatment >= years_to_vote:
+                        election_treatment.add_voter(
+                            Voter(
+                                altruism,
+                                accuracy * (1 + current_accuracy_boost),
+                                turnout_prob + current_turnout_boost,
+                            )
+                        )
+                    else:
+                        election_treatment.add_voter(
+                            Voter(altruism, accuracy, turnout_prob)
+                        )
+                else:
+                    election_treatment.add_voter(
+                        Voter(altruism, accuracy, turnout_prob)
+                    )
+            # Basic voter characteristics
+            altruism = ~sq.beta(2, 5)
+            accuracy = ~sq.lognorm(0.5, 2)
+            turnout_prob = ~sq.beta(4, 6)
+
+            # Add to baseline election
+            election_base.add_voter(Voter(altruism, accuracy, turnout_prob))
+
+            # Add to treatment election with boosted parameters for treated population
+            if i < n_treated:
+                # Apply civics education effects with decay
+                years_since_treatment = max(0, year - 2025)
+                current_accuracy_boost = accuracy_boost * (
+                    annual_decay**years_since_treatment
+                )
+                current_turnout_boost = turnout_boost * (
+                    annual_decay**years_since_treatment
                 )
 
-                # Calculate aligned voters
-                aligned_voters = effective_voters * alignment_effect
+                # Check if voter is of voting age
+                voter_age = np.random.uniform(params["min_age"], params["max_age"])
+                years_to_vote = max(0, 18 - voter_age)
 
-                # Simulate multiple races
-                for _ in range(params["races_per_year"]):
-                    # Random election margin (using lognormal to ensure positive)
-                    margin = ~sq.lognorm(0.01, 0.05)
-
-                    # Election size varies by type (local vs state vs federal)
-                    election_size = ~sq.mixture(
-                        [
-                            [
-                                0.6,
-                                sq.lognorm(10 * K, 100 * K),
-                            ],  # Local: 10K-100K voters
-                            [0.3, sq.lognorm(100 * K, 1 * M)],  # State: 100K-1M voters
-                            [0.1, sq.lognorm(1 * M, 10 * M)],  # Federal: 1M-10M voters
-                        ]
-                    )
-
-                    # Ensure probability is strictly between 0 and 1
-                    swing_prob = min(
-                        max(float(aligned_voters / (election_size * margin)), 0.001),
-                        0.999,
-                    )
-
-                    # If election swings, calculate policy value
-                    if ~sq.bernoulli(swing_prob):
-                        # Policy value distribution varies by race type
-                        policy_value = ~sq.mixture(
-                            [
-                                [0.6, sq.lognorm(100, 10 * K)],  # Local policy
-                                [0.3, sq.lognorm(10 * K, 100 * K)],  # State policy
-                                [0.1, sq.lognorm(100 * K, 1 * M)],  # Federal policy
-                            ]
+                if years_since_treatment >= years_to_vote:
+                    election_treatment.add_voter(
+                        Voter(
+                            altruism,
+                            accuracy * (1 + current_accuracy_boost),
+                            turnout_prob + current_turnout_boost,
                         )
-                        total_qalys += policy_value
+                    )
+                else:
+                    election_treatment.add_voter(
+                        Voter(altruism, accuracy, turnout_prob)
+                    )
+            else:
+                election_treatment.add_voter(Voter(altruism, accuracy, turnout_prob))
 
-        # Account for STEM tradeoff
-        stem_impact = ~sq.norm(
-            mean=-params["stem_tradeoff"], sd=params["stem_tradeoff"] / 4
+        # Run elections
+        base_result = election_base.run_election()
+        treatment_result = election_treatment.run_election()
+
+        # Calculate QALY difference
+        qaly_diff = sum(treatment_result["qaly_impact"].values()) - sum(
+            base_result["qaly_impact"].values()
         )
-        total_qalys *= 1 + stem_impact
 
-        # Calculate cost-effectiveness
-        cost_effectiveness = total_qalys / params["marginal_budget"]
-        results.append(cost_effectiveness)
+        # Update progress bar
+        progress_bar.progress((i + 1) / 20)
 
-    return np.array(results)
+        results.append(
+            {
+                "year": year,
+                "qaly_diff": qaly_diff,
+                "base_turnout": base_result["turnout"],
+                "treatment_turnout": treatment_result["turnout"],
+                "base_margin": base_result["margin"],
+                "treatment_margin": treatment_result["margin"],
+            }
+        )
+
+    return pd.DataFrame(results)
 
 
 def create_impact_app():
-    st.title("iCivics Impact Analysis")
+    st.title("iCivics Impact Analysis - Micro-founded Model")
 
     st.markdown(
         """
-    This app simulates the marginal impact of additional funding for iCivics,
-    considering various pathways to impact including voting behavior, policy
-    outcomes, and educational tradeoffs.
+    This simulation models individual voter behavior based on:
+    - Altruism (weight assigned to QALYs vs other preferences)
+    - Accuracy (ability to perceive true QALY impacts)
+    - Turnout probability
     """
     )
 
-    # Parameter input sections
-    st.header("Cost Parameters")
+    # Parameters
+    st.header("Parameters")
 
-    st.markdown(
-        """
-    **Current Cost Context:**
-    - iCivics' current budget: $11.3M serving 9M students
-    - Current average cost: ~$1.26 per student
-    - Marginal costs often higher due to:
-        - Reaching harder-to-serve populations
-        - New program development needs
-        - Implementation support requirements
-    """
-    )
+    col1, col2 = st.columns(2)
 
-    marginal_budget = st.number_input(
-        "Additional Funding ($)",
-        min_value=100_000,
-        max_value=10_000_000,
-        value=1_000_000,
-        step=100_000,
-    )
+    with col1:
+        marginal_budget = st.number_input(
+            "Additional Funding ($)",
+            min_value=100_000,
+            max_value=10_000_000,
+            value=1_000_000,
+        )
 
-    marginal_cost_low = st.slider(
-        "Minimum Marginal Cost per Student ($)",
-        min_value=1.0,
-        max_value=10.0,
-        value=2.0,
-        help="Minimum expected cost to reach an additional student",
-    )
+        cost_per_student = st.number_input(
+            "Cost per Student ($)", min_value=1.0, max_value=20.0, value=5.0
+        )
 
-    marginal_cost_high = st.slider(
-        "Maximum Marginal Cost per Student ($)",
-        min_value=marginal_cost_low,
-        max_value=15.0,
-        value=5.0,
-        help="Maximum expected cost to reach an additional student",
-    )
-
-    st.header("Educational Impact Parameters")
-
-    st.markdown(
-        """
-    **STEM Tradeoff Context:**
-    - Current integration with numeracy (e.g., People's Pie game)
-    - Shared critical thinking skills
-    - Time allocation in school day
-    """
-    )
-
-    stem_tradeoff = (
-        st.slider(
-            "STEM Curriculum Displacement (%)",
+        accuracy_improvement = st.slider(
+            "Accuracy Improvement",
             min_value=0.0,
-            max_value=30.0,
-            value=15.0,
-            help="Percentage of civics time that trades off with STEM",
+            max_value=1.0,
+            value=0.2,
+            help="Proportional improvement in QALY perception accuracy",
         )
-        / 100
-    )
 
-    knowledge_retention = (
-        st.slider(
-            "Annual Knowledge Retention Rate (%)",
-            min_value=50,
-            max_value=95,
-            value=85,
-            help="Percentage of civics knowledge retained year-over-year",
+    with col2:
+        turnout_boost = st.slider(
+            "Turnout Boost",
+            min_value=0.0,
+            max_value=0.3,
+            value=0.1,
+            help="Percentage point increase in turnout probability",
         )
-        / 100
-    )
 
-    st.header("Voting Impact Parameters")
-
-    mean_years_to_vote = st.slider(
-        "Mean Years Until First Vote",
-        min_value=1,
-        max_value=10,
-        value=6,
-        help="Average years between civics education and first election",
-    )
-
-    voting_boost = (
-        st.slider(
-            "Voting Rate Increase (%)",
-            min_value=5,
-            max_value=30,
-            value=15,
-            help="Increase in probability of voting due to civics education",
+        effect_decay = st.slider(
+            "Annual Effect Decay",
+            min_value=0.5,
+            max_value=1.0,
+            value=0.9,
+            help="Proportion of effect retained each year",
         )
-        / 100
-    )
 
-    alignment_improvement = (
-        st.slider(
-            "Policy Alignment Improvement (%)",
-            min_value=1,
-            max_value=20,
-            value=10,
-            help="Increase in probability of voting for higher-impact policies",
-        )
-        / 100
-    )
+        min_age = st.number_input("Minimum Student Age", value=12)
+        max_age = st.number_input("Maximum Student Age", value=18)
 
-    races_per_year = st.slider(
-        "Average Relevant Races per Year",
-        min_value=1,
-        max_value=20,
-        value=12,
-        help="Number of elections where student votes could matter",
-    )
-
-    # Run simulation
     if st.button("Run Simulation"):
         params = {
             "marginal_budget": marginal_budget,
-            "marginal_cost_low": marginal_cost_low,
-            "marginal_cost_high": marginal_cost_high,
-            "stem_tradeoff": stem_tradeoff,
-            "knowledge_retention_rate": knowledge_retention,
-            "mean_years_to_vote": mean_years_to_vote,
-            "voting_rate_boost": voting_boost,
-            "alignment_improvement": alignment_improvement,
-            "races_per_year": races_per_year,
+            "cost_per_student": cost_per_student,
+            "accuracy_improvement": accuracy_improvement,
+            "turnout_boost": turnout_boost,
+            "effect_decay": effect_decay,
+            "min_age": min_age,
+            "max_age": max_age,
         }
 
-        with st.spinner("Running simulation..."):
-            results = run_impact_simulation(params)
+        results = simulate_civics_impact(params)
+
+        # Calculate cost-effectiveness
+        total_qaly_diff = results["qaly_diff"].sum()
+        cost_effectiveness = total_qaly_diff / marginal_budget
 
         st.header("Results")
 
-        # Display summary statistics
-        st.subheader("Cost-Effectiveness Summary")
-        col1, col2, col3 = st.columns(3)
+        col1, col2 = st.columns(2)
         with col1:
-            st.metric("Mean QALYs/$", f"{np.mean(results):.2f}")
+            st.metric("Total QALYs", f"{total_qaly_diff:,.0f}")
         with col2:
-            st.metric("Median QALYs/$", f"{np.median(results):.2f}")
-        with col3:
-            ci_width = np.percentile(results, 95) - np.percentile(results, 5)
-            st.metric("95% CI Width", f"{ci_width:.2f}")
+            st.metric("QALYs per Dollar", f"{cost_effectiveness:.2f}")
 
-        # Plot distribution
+        # Plot QALY difference over time
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.hist(results, bins=50, density=True)
-        ax.axvline(np.mean(results), color="r", linestyle="dashed", label="Mean")
-        ax.axvline(np.median(results), color="g", linestyle="dashed", label="Median")
-        ax.set_title("Distribution of Cost-Effectiveness Estimates")
-        ax.set_xlabel("QALYs per Dollar")
-        ax.set_ylabel("Density")
-        ax.legend()
+        ax.plot(results["year"], results["qaly_diff"])
+        ax.set_title("QALY Impact by Year")
+        ax.set_xlabel("Year")
+        ax.set_ylabel("QALY Difference")
         st.pyplot(fig)
 
-        # Display percentiles
-        st.subheader("Percentile Analysis")
-        percentiles = [1, 5, 25, 50, 75, 95, 99]
-        percentile_values = np.percentile(results, percentiles)
-        percentile_df = pd.DataFrame(
-            {"Percentile": percentiles, "QALYs/$": percentile_values}
-        )
-        st.table(percentile_df)
+        # Plot turnout difference
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.plot(results["year"], results["treatment_turnout"] - results["base_turnout"])
+        ax.set_title("Turnout Difference by Year")
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Percentage Point Difference")
+        st.pyplot(fig)
 
-        # Additional analysis
-        st.subheader("Key Drivers")
-        st.markdown(
-            """
-        The simulation shows several key factors driving impact:
-        1. Local election effects tend to be more certain and immediate
-        2. Knowledge retention significantly affects long-term impact
-        3. STEM tradeoffs can be partially mitigated through integrated learning
-        
-        **Note on Parameter Sensitivity:**
-        - Election size has high impact on swing probability
-        - Knowledge retention compounds over multiple election cycles
-        - Policy value varies significantly by election type
-        """
-        )
+        # Show detailed results
+        st.subheader("Detailed Results by Year")
+        st.dataframe(results)
 
 
 if __name__ == "__main__":
